@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Production/runtime data
+data/*.json
+data/*.txt
+
+# Runtime locks/logs
+*.lock
+*.log
+
+# Local backups/checkpoints
+CHECKPOINT_*/
+MEGA_BACKUP_*/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

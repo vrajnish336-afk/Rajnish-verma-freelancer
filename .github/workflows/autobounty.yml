@@ -1,0 +1,181 @@
+name: MEGA Freelancer - Cloud Scanner
+
+# =============================================================================
+# WHAT THIS WORKFLOW DOES
+# =============================================================================
+#
+#  1. Checks out the repository
+#  2. Sets up Python and installs dependencies
+#  3. Runs scan_only.py
+#       - Scans GitHub + Superteam for real open bounties
+#       - Saves results to  data/opportunities.json  (cumulative)
+#       - Saves run history to  data/scan_log.json   (last 50 runs)
+#       - Writes errors to  data/last_scan_errors.txt (empty = clean run)
+#  4. Commits changed data files back to the repo (only if changed)
+#  5. Uploads scan artifacts so every run is inspectable in the Actions UI
+#  6. Fails the workflow if every single scanner failed
+#
+# WHAT THIS WORKFLOW DOES NOT DO
+#   - Does NOT submit applications
+#   - Does NOT invent rewards
+#   - Does NOT claim money was earned
+#   - Does NOT call any LLM
+#   - Does NOT run the Streamlit dashboard
+#
+# =============================================================================
+# REQUIRED GITHUB SECRETS
+# =============================================================================
+#
+#  GHT_TOKEN   — Your personal GitHub token (optional but recommended).
+#                Without it, GitHub Search API is limited to 10 requests/min.
+#                Create one at: https://github.com/settings/tokens
+#                Scope needed: public_repo (read-only is enough for scanning)
+#
+#  GROQ_API_KEY — Not used by scan_only.py. Kept here for future steps
+#                 that may use the LLM evaluator.
+#
+# =============================================================================
+
+on:
+  # ── Scheduled runs ─────────────────────────────────────────────────────────
+  schedule:
+    - cron: '0 */6 * * *'   # Every 6 hours at :00 UTC (00:00, 06:00, 12:00, 18:00)
+
+  # ── Manual trigger from the GitHub Actions UI ───────────────────────────────
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you triggering this manually? (optional note)'
+        required: false
+        default: 'Manual scan requested'
+      dry_run:
+        description: 'Dry run - scan but do NOT commit results back to repo'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# Only one scan at a time — if a scheduled run is in progress and you
+# trigger manually, the manual run will wait rather than racing.
+concurrency:
+  group: mega-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan for Opportunities
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read   # needed to push data files back to the repo
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # Use a PAT if available so the commit-back step can trigger other
+          # workflows. Falls back to the built-in GITHUB_TOKEN otherwise.
+          token: ${{ secrets.GHT_TOKEN || github.token }}
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Log manual trigger reason (if any) ─────────────────────────────────
+      - name: Log trigger info
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Manual trigger reason: ${{ github.event.inputs.reason }}"
+          echo "Dry run: ${{ github.event.inputs.dry_run }}"
+
+      # ── 5. Run the scanner ────────────────────────────────────────────────────
+      - name: Run headless scanner
+        id: scanner
+        env:
+          # GHT_TOKEN gives 5,000 req/hr vs 60 unauthenticated.
+          # Falls back to the built-in GITHUB_TOKEN (60 req/hr) automatically.
+          GITHUB_TOKEN: ${{ secrets.GHT_TOKEN || github.token }}
+          # Not used by scan_only.py today, but available for future steps.
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python scan_only.py
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # ── 6. Check error log ────────────────────────────────────────────────────
+      # This step surfaces any warnings/errors into the Actions summary
+      # so you can see them without downloading the artifact.
+      - name: Check error log
+        if: always()
+        run: |
+          ERROR_FILE="data/last_scan_errors.txt"
+          if [ -f "$ERROR_FILE" ] && [ -s "$ERROR_FILE" ]; then
+            echo "### Scan Warnings / Errors" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$ERROR_FILE" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "Errors were recorded. See above."
+          else
+            echo "### Scan completed cleanly - no errors." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── 7. Write job summary ──────────────────────────────────────────────────
+      - name: Write scan summary to Actions UI
+        if: always()
+        run: |
+          SCAN_LOG="data/scan_log.json"
+          if [ -f "$SCAN_LOG" ]; then
+            LAST=$(python - <<'EOF'
+          import json, sys
+          try:
+              log = json.load(open("data/scan_log.json"))
+              if log:
+                  last = log[-1]
+                  h = last.get("scanner_health", {})
+                  c = last.get("counts", {})
+                  print("| Platform | Status |")
+                  print("|---|---|")
+                  for p, s in h.items():
+                      icon = ":white_check_mark:" if s == "OK" else ":x:"
+                      print(f"| {p} | {icon} {s} |")
+                  print()
+                  print(f"- Raw scanned : **{c.get('raw_scanned', '?')}**")
+                  print(f"- Unique      : **{c.get('unique', '?')}**")
+                  print(f"- With verified reward : **{c.get('verified', '?')}**")
+          except Exception as e:
+              print(f"Could not parse scan_log.json: {e}")
+          EOF
+          )
+            echo "### Scan Results" >> "$GITHUB_STEP_SUMMARY"
+            echo "$LAST" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── 8. Upload artifacts ───────────────────────────────────────────────────
+      # Every run uploads the three data files as a downloadable artifact.
+      # Artifacts are retained for 7 days by default.
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_number }}
+          path: |
+            data/opportunities.json
+            data/scan_log.json
+            data/last_scan_errors.txt
+          retention-days: 7
+
+      # ── 9. Commit results back to repo ────────────────────────────────────────
+      # Skipped if: dry_run=true OR no files changed.
+

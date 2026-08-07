@@ -1,0 +1,4 @@
+# This file is intentionally left here as a reference copy.
+# The ACTIVE workflow is at .github/workflows/autobounty.yml
+# GitHub Actions only reads files inside .github/workflows/ — not this directory.
+# See .github/workflows/autobounty.yml for the real workflow.
